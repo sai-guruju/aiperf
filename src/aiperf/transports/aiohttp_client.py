@@ -20,6 +20,7 @@ from aiperf.common.models import (
     TextResponse,
 )
 from aiperf.transports.aiohttp_trace import create_aiohttp_trace_config
+from aiperf.transports.aws_event_stream import decode_aws_event_stream
 from aiperf.transports.http_defaults import AioHttpDefaults, SocketDefaults
 from aiperf.transports.sse_utils import AsyncSSEStreamReader
 
@@ -207,13 +208,16 @@ class AioHttpClient(AIPerfLoggerMixin):
                                 _trace.response_receive_end_perf_ns = chunk_ns
                                 yield chunk
 
+                        # Decode AWS event-stream binary framing if present
+                        # (SageMaker wraps SSE payloads in binary frames).
+                        # For standard SSE servers this is a no-op passthrough.
+                        sse_stream = decode_aws_event_stream(tracked_content_stream())
+
                         # Separate code paths for performance: avoid callback checks
                         # when no callback is registered
                         if first_token_callback:
                             first_token_acquired = False
-                            async for message in AsyncSSEStreamReader(
-                                tracked_content_stream()
-                            ):
+                            async for message in AsyncSSEStreamReader(sse_stream):
                                 AsyncSSEStreamReader.inspect_message_for_error(message)
                                 record.responses.append(message)
                                 # Fire callback until it returns True (meaningful content found)
@@ -224,9 +228,7 @@ class AioHttpClient(AIPerfLoggerMixin):
                                     )
                         else:
                             # Fast path: no callback, just collect responses
-                            async for message in AsyncSSEStreamReader(
-                                tracked_content_stream()
-                            ):
+                            async for message in AsyncSSEStreamReader(sse_stream):
                                 AsyncSSEStreamReader.inspect_message_for_error(message)
                                 record.responses.append(message)
                         record.end_perf_ns = time.perf_counter_ns()
