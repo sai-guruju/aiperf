@@ -18,7 +18,9 @@ stitching, multi-field parsing) that does not apply here.
 
 from __future__ import annotations
 
+import struct
 import time
+import zlib
 from collections.abc import AsyncIterator
 from functools import cache
 from typing import TYPE_CHECKING, Any
@@ -30,6 +32,57 @@ if TYPE_CHECKING:
     from botocore.eventstream import EventStreamBuffer
 
 EVENTSTREAM_CONTENT_TYPE = "application/vnd.amazon.eventstream"
+_PRELUDE_LENGTH = 12
+_MIN_MESSAGE_LENGTH = 16
+_SSE_FIELD_PREFIXES = (b"data:", b"event:", b"id:", b"retry:", b":")
+
+
+def looks_like_aws_event_stream_prelude(data: bytes) -> bool:
+    """Return whether ``data`` begins with a valid AWS event-stream prelude.
+
+    Some SageMaker inference-component routes return AWS binary event-stream
+    frames while declaring ``text/event-stream``. Checking the prelude CRC lets
+    the HTTP client distinguish that response from real SSE without relying on
+    the endpoint URL or authentication method.
+    """
+    if len(data) < _PRELUDE_LENGTH:
+        return False
+
+    total_length, headers_length, expected_crc = struct.unpack(">III", data[:12])
+    if total_length < _MIN_MESSAGE_LENGTH:
+        return False
+    if headers_length > total_length - _MIN_MESSAGE_LENGTH:
+        return False
+    return zlib.crc32(data[:8]) & 0xFFFFFFFF == expected_crc
+
+
+async def probe_aws_event_stream(
+    raw_stream: AsyncIterator[bytes],
+) -> tuple[bool, AsyncIterator[bytes]]:
+    """Inspect enough bytes to identify AWS framing, then replay every chunk.
+
+    The probe never drops or coalesces bytes: the returned iterator first
+    yields the original buffered chunks in their original order, then resumes
+    the source iterator. Short and empty streams therefore remain unchanged.
+    """
+    buffered_chunks: list[bytes] = []
+    prefix = bytearray()
+    async for chunk in raw_stream:
+        buffered_chunks.append(chunk)
+        prefix.extend(chunk)
+        if bytes(prefix).lstrip().startswith(_SSE_FIELD_PREFIXES):
+            break
+        if len(prefix) >= _PRELUDE_LENGTH:
+            break
+
+    async def replay() -> AsyncIterator[bytes]:
+        for chunk in buffered_chunks:
+            yield chunk
+        async for chunk in raw_stream:
+            yield chunk
+
+    is_sse = bytes(prefix).lstrip().startswith(_SSE_FIELD_PREFIXES)
+    return not is_sse and looks_like_aws_event_stream_prelude(bytes(prefix)), replay()
 
 
 class AwsEventStreamError(RuntimeError):
@@ -70,9 +123,11 @@ def _split_complete_lines(buffer: bytearray) -> tuple[list[bytes], bytearray]:
     while b"\n" in buffer:
         line, _, rest = buffer.partition(b"\n")
         buffer = bytearray(rest)
-        stripped = line.strip()
-        if stripped:
-            lines.append(bytes(stripped))
+        # Emptiness is judged on the stripped form, but the line keeps its
+        # bytes: ``AwsEventStreamMessage.raw_line`` is the undecoded wire
+        # content, and raw-record exports must reproduce what was sent.
+        if line.strip():
+            lines.append(bytes(line))
     return lines, buffer
 
 
@@ -98,12 +153,19 @@ def _stream_message_for_line(line: bytes, perf_ns: int) -> AwsEventStreamMessage
     return AwsEventStreamMessage(perf_ns=perf_ns, line=text, raw_line=bytes(line))
 
 
-def _error_from_frame(message_type: str, message: Any) -> AwsEventStreamError:
+def _error_from_frame(
+    message_type: str, message: Any, partial_line: bytes = b""
+) -> AwsEventStreamError:
     """Build a typed error from an ``error``/``exception`` frame.
 
     AWS labels the failure in ``:exception-type`` (exception frames) or
     ``:error-code`` (error frames), with prose in ``:error-message``. Both are
     read so the label survives into ``ErrorDetails.type``.
+
+    ``partial_line`` is whatever had been buffered but not yet newline-terminated
+    when the failure arrived. The clean-EOF path flushes such a fragment as a
+    message; raising would otherwise discard it, and a half-written token is
+    often the most diagnostic thing about a mid-stream server failure.
     """
     headers = message.headers
     exception_type = headers.get(":exception-type") or headers.get(":error-code")
@@ -111,9 +173,24 @@ def _error_from_frame(message_type: str, message: Any) -> AwsEventStreamError:
         "utf-8", errors="replace"
     )
     label = exception_type or message_type
+    text = f"AWS eventstream {message_type} ({label}): {detail}"
+    if partial_line.strip():
+        decoded = partial_line.decode("utf-8", errors="replace")
+        text = f"{text} [partial line buffered at failure: {decoded!r}]"
+    return AwsEventStreamError(text, exception_type=exception_type)
+
+
+def _decode_error(exc: Exception) -> AwsEventStreamError:
+    """Wrap a botocore framing/CRC failure as an eventstream error.
+
+    botocore owns frame and checksum validation and raises its own types
+    (``ChecksumMismatch``, ``ParserError``, ...). Letting those escape means the
+    error table groups a corrupt stream under a botocore class name rather than
+    alongside every other eventstream failure.
+    """
     return AwsEventStreamError(
-        f"AWS eventstream {message_type} ({label}): {detail}",
-        exception_type=exception_type,
+        f"Malformed AWS eventstream frame: {type(exc).__name__}: {exc}",
+        exception_type=type(exc).__name__,
     )
 
 
@@ -146,15 +223,20 @@ class AwsEventStreamReader:
             # the frames genuinely arrived together -- and would make
             # eventstream ITL non-comparable to SSE ITL from the same server.
             chunk_perf_ns = time.perf_counter_ns()
-            decoder.add_data(chunk)
+            try:
+                decoder.add_data(chunk)
+            except Exception as e:
+                raise _decode_error(e) from e
             while True:
                 try:
                     message = decoder.next()
                 except StopIteration:
                     break
+                except Exception as e:
+                    raise _decode_error(e) from e
                 message_type = message.headers.get(":message-type")
                 if message_type in ("error", "exception"):
-                    raise _error_from_frame(message_type, message)
+                    raise _error_from_frame(message_type, message, bytes(line_buffer))
                 if message.headers.get(":event-type") != "PayloadPart":
                     continue
                 # Accumulate across PayloadPart messages and only split on a
@@ -166,9 +248,10 @@ class AwsEventStreamReader:
                 lines, line_buffer = _split_complete_lines(line_buffer)
                 for line in lines:
                     yield _stream_message_for_line(line, chunk_perf_ns)
-        stripped = line_buffer.strip()
-        if stripped:
-            yield _stream_message_for_line(bytes(stripped), time.perf_counter_ns())
+        # Same rule as the main loop: emptiness on the stripped form, bytes
+        # as received on the message.
+        if line_buffer.strip():
+            yield _stream_message_for_line(bytes(line_buffer), time.perf_counter_ns())
 
     @staticmethod
     def inspect_message_for_error(message: AwsEventStreamMessage) -> None:

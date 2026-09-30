@@ -24,6 +24,7 @@ from aiperf.transports.aws.eventstream import (
     EVENTSTREAM_CONTENT_TYPE,
     AwsEventStreamError,
     AwsEventStreamReader,
+    probe_aws_event_stream,
 )
 from aiperf.transports.http_defaults import AioHttpDefaults, SocketDefaults
 from aiperf.transports.sse_utils import AsyncSSEStreamReader
@@ -220,14 +221,23 @@ class AioHttpClient(AIPerfLoggerMixin):
                         # inspect_message_for_error), so the reader class is the
                         # only thing that varies below -- downstream code relies
                         # on that shared protocol, not on SSEMessage specifically.
-                        # Selection is by content type alone, never by service,
-                        # which is what lets Bedrock reuse this unchanged.
+                        # Correctly labeled AWS responses select the binary
+                        # reader by content type. Some SageMaker inference-
+                        # component routes label the same binary framing as
+                        # text/event-stream, so those are selected by a valid
+                        # frame prelude instead of by URL or service name.
+                        response_stream = tracked_content_stream()
+                        if not is_eventstream:
+                            (
+                                is_eventstream,
+                                response_stream,
+                            ) = await probe_aws_event_stream(response_stream)
                         reader_cls = (
                             AwsEventStreamReader
                             if is_eventstream
                             else AsyncSSEStreamReader
                         )
-                        sse_messages = reader_cls(tracked_content_stream())
+                        sse_messages = reader_cls(response_stream)
 
                         # Separate code paths for performance: avoid callback checks
                         # when no callback is registered

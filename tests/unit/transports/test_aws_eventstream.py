@@ -18,9 +18,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
+# botocore ships only in the optional aiperf[aws] extra, and CI installs
+# "--extra test --no-dev" on Windows-on-ARM. Skip the module rather than
+# failing collection there; these tests decode real eventstream frames.
+pytest.importorskip("botocore")
+
 from aiperf.transports.aws.eventstream import (
     AwsEventStreamError,
     AwsEventStreamReader,
+    looks_like_aws_event_stream_prelude,
+    probe_aws_event_stream,
 )
 
 
@@ -65,6 +72,58 @@ def encode_frame(
 async def _chunks(*items: bytes) -> AsyncIterator[bytes]:
     for item in items:
         yield item
+
+
+class TestAwsEventStreamProbe:
+    def test_valid_frame_is_detected(self) -> None:
+        assert looks_like_aws_event_stream_prelude(encode_frame(b"payload"))
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"",
+            b"short",
+            b'data: {"delta":"ordinary SSE"}\n\n',
+        ],
+    )
+    def test_non_event_stream_data_is_not_detected(self, data: bytes) -> None:
+        assert not looks_like_aws_event_stream_prelude(data)
+
+    def test_corrupt_prelude_crc_is_not_detected(self) -> None:
+        frame = bytearray(encode_frame(b"payload"))
+        frame[8] ^= 0xFF
+
+        assert not looks_like_aws_event_stream_prelude(bytes(frame))
+
+    @pytest.mark.asyncio
+    async def test_split_prelude_is_detected_and_replayed_exactly(self) -> None:
+        frame = encode_frame(b'data: {"delta":"split"}\n')
+        chunks = (frame[:3], frame[3:9], frame[9:17], frame[17:])
+
+        detected, replay = await probe_aws_event_stream(_chunks(*chunks))
+
+        assert detected
+        assert [chunk async for chunk in replay] == list(chunks)
+
+    @pytest.mark.asyncio
+    async def test_sse_is_replayed_exactly(self) -> None:
+        chunks = (b"data: first", b"\n\ndata: second\n\n")
+
+        detected, replay = await probe_aws_event_stream(_chunks(*chunks))
+
+        assert not detected
+        assert [chunk async for chunk in replay] == list(chunks)
+
+    @pytest.mark.asyncio
+    async def test_short_sse_message_does_not_wait_for_another_chunk(self) -> None:
+        async def short_sse_then_fail() -> AsyncIterator[bytes]:
+            yield b"data:x\n\n"
+            raise AssertionError("the probe requested a second SSE chunk")
+
+        detected, replay = await probe_aws_event_stream(short_sse_then_fail())
+
+        assert not detected
+        assert await anext(replay) == b"data:x\n\n"
 
 
 class TestAwsEventStreamReaderBasicDecoding:
@@ -293,3 +352,126 @@ class TestAwsEventStreamMessageProtocolConformance:
         assert message.get_json() == {"a": 1}
         assert message.get_text() == '{"a": 1}'
         assert message.get_raw() == b'data: {"a": 1}'
+
+
+class TestRawLineFidelity:
+    """``raw_line`` is documented as the undecoded bytes exactly as received, and
+    ``get_raw()`` feeds raw-record exports. Normalizing it would mean an export
+    could not reproduce what the server actually sent."""
+
+    @pytest.mark.asyncio
+    async def test_surrounding_whitespace_is_preserved_in_raw_line(self) -> None:
+        frame = encode_frame(b'  data: {"a": 1}  \n')
+
+        messages = [m async for m in AwsEventStreamReader(_chunks(frame))]
+
+        assert len(messages) == 1
+        # The decoded view is normalized...
+        assert messages[0].line == '{"a": 1}'
+        # ...while the raw view keeps what arrived.
+        assert messages[0].raw_line == b'  data: {"a": 1}  '
+
+    @pytest.mark.asyncio
+    async def test_trailing_line_without_newline_keeps_its_bytes(self) -> None:
+        """The final flush path builds a message too, and must not normalize
+        differently from the main loop."""
+        frame = encode_frame(b'  {"b": 2}  ')
+
+        messages = [m async for m in AwsEventStreamReader(_chunks(frame))]
+
+        assert len(messages) == 1
+        assert messages[0].line == '{"b": 2}'
+        assert messages[0].raw_line == b'  {"b": 2}  '
+
+
+class TestChunkTimestampSharing:
+    """One timestamp per network read, shared by every message decoded from it.
+
+    Deliberate, and matched to what ``sse_utils.py`` does for SSE -- stamping at
+    decode time would fold decode latency into ITL and make the two framings
+    non-comparable. Pinned here because the existing decode tests happen to put
+    each frame in its own chunk, so a refactor to per-frame stamping would not
+    have failed anything.
+    """
+
+    @pytest.mark.asyncio
+    async def test_frames_arriving_in_one_read_share_a_timestamp(self) -> None:
+        one_read = encode_frame(b'data: {"i": 1}\n') + encode_frame(b'data: {"i": 2}\n')
+
+        messages = [m async for m in AwsEventStreamReader(_chunks(one_read))]
+
+        assert len(messages) == 2
+        assert messages[0].perf_ns == messages[1].perf_ns
+
+    @pytest.mark.asyncio
+    async def test_frames_arriving_in_separate_reads_do_not(self) -> None:
+        """Guards the test above: equal timestamps must mean 'same read', not
+        'the clock is stubbed'."""
+        messages = [
+            m
+            async for m in AwsEventStreamReader(
+                _chunks(
+                    encode_frame(b'data: {"i": 1}\n'), encode_frame(b'data: {"i": 2}\n')
+                )
+            )
+        ]
+
+        assert len(messages) == 2
+        assert messages[0].perf_ns != messages[1].perf_ns
+
+
+class TestPartialLineOnErrorPath:
+    """A line still buffered when an error frame arrives is often the most
+    diagnostic thing about a server-side failure, and the clean-EOF path would
+    have surfaced it. Raising must not silently discard it."""
+
+    @pytest.mark.asyncio
+    async def test_buffered_partial_line_is_reported_with_the_error(self) -> None:
+        # Truncated mid-token on purpose. The fragment is deliberately not a
+        # near-dictionary word, so spell-checkers do not flag the fixture.
+        partial = encode_frame(b'data: {"choices":[{"delta":{"content":"abcd')
+        failure = encode_frame(
+            b"", message_type="error", extra_headers={":error-code": "ModelStreamError"}
+        )
+
+        with pytest.raises(AwsEventStreamError) as excinfo:
+            async for _ in AwsEventStreamReader(_chunks(partial, failure)):
+                pass
+
+        assert "abcd" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_no_partial_line_leaves_the_message_unchanged(self) -> None:
+        """Nothing buffered means nothing appended -- no empty parenthetical."""
+        failure = encode_frame(b"boom", message_type="error")
+
+        with pytest.raises(AwsEventStreamError) as excinfo:
+            async for _ in AwsEventStreamReader(_chunks(failure)):
+                pass
+
+        assert "partial" not in str(excinfo.value).lower()
+
+
+class TestCorruptFrameHandling:
+    """botocore validates framing and CRCs, so a corrupt frame raises one of its
+    exceptions. Those should surface as AwsEventStreamError like every other
+    stream failure, rather than as a botocore type the error table cannot group.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_corrupt_crc_surfaces_as_an_eventstream_error(self) -> None:
+        frame = bytearray(encode_frame(b'data: {"a": 1}\n'))
+        frame[-1] ^= 0xFF  # break the trailing message CRC
+
+        with pytest.raises(AwsEventStreamError):
+            async for _ in AwsEventStreamReader(_chunks(bytes(frame))):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_a_corrupt_prelude_surfaces_as_an_eventstream_error(self) -> None:
+        frame = bytearray(encode_frame(b'data: {"a": 1}\n'))
+        frame[0] ^= 0xFF  # break the declared total length
+
+        with pytest.raises(AwsEventStreamError):
+            async for _ in AwsEventStreamReader(_chunks(bytes(frame))):
+                pass
