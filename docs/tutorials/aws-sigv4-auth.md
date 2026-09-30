@@ -15,7 +15,7 @@ This guide walks you through benchmarking inference endpoints protected by AWS I
 | Scenario | Non-Streaming | Streaming | Notes |
 |----------|:---:|:---:|-------|
 | API Gateway + vLLM/TGI/NIM | Yes | Yes | Standard HTTP + SSE |
-| SageMaker + vLLM/LMI container | Yes | Yes | Streaming responses use AWS event-stream framing, which AIPerf decodes automatically. |
+| SageMaker + vLLM/LMI container | Yes | No | Non-streaming only. SageMaker uses proprietary event framing instead of SSE. |
 | Bedrock Converse / InvokeModel | No | No | Different request/response schema -- not OpenAI-compatible |
 
 Endpoints that send `multipart/form-data` (`image_edit`, `video_generation`) are
@@ -76,7 +76,7 @@ aiperf profile \
     --request-count 100
 ```
 
-### SageMaker with vLLM or LMI
+### SageMaker with vLLM or LMI (Non-Streaming)
 
 SageMaker endpoints running vLLM or DJL LMI containers accept OpenAI-format request bodies through the `/invocations` path. The response body is passed through unchanged, so non-streaming works. Use `--endpoint` to set the SageMaker invocation path:
 
@@ -92,34 +92,7 @@ aiperf profile \
     --request-count 100
 ```
 
-For streaming, use SageMaker Runtime's response-stream invocation path and add
-`--streaming`. AIPerf decodes the AWS event-stream frames and records TTFT and
-inter-token latency from the payload parts:
-
-```bash
-aiperf profile \
-    --model my-model \
-    --url https://runtime.sagemaker.us-east-1.amazonaws.com \
-    --endpoint /endpoints/my-endpoint/invocations-response-stream \
-    --endpoint-type chat \
-    --streaming \
-    --auth-type sigv4 \
-    --aws-region us-east-1 \
-    --aws-service sagemaker \
-    --request-count 100
-```
-
-For an inference component, send its name in the SageMaker target header:
-
-```bash
---header "X-Amzn-SageMaker-Inference-Component: my-inference-component"
-```
-
-Some gateways expose an OpenAI-compatible inference-component path and label
-the binary response as `text/event-stream`. AIPerf validates the AWS frame
-prelude and automatically selects the event-stream decoder, so both correctly
-labeled SageMaker Runtime responses and those gateway responses work with
-`--streaming`.
+Streaming is not supported for SageMaker endpoints because SageMaker uses a proprietary event stream format instead of SSE. Do not pass `--streaming` with SageMaker.
 
 ## Figuring Out Your Region and Service Name
 

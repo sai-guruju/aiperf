@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import aiohttp
 import pytest
 
-from aiperf.common.models import AwsEventStreamMessage, SSEField, SSEMessage
+from aiperf.common.models import SSEField, SSEMessage
 from aiperf.transports.aiohttp_client import AioHttpClient
 from aiperf.transports.sse_utils import AsyncSSEStreamReader
 from tests.unit.transports.conftest import (
@@ -377,32 +377,6 @@ class TestAioHttpClient:
             assert_successful_request_record(
                 record, expected_response_count=2, expected_response_type=SSEMessage
             )
-
-    @pytest.mark.asyncio
-    async def test_mislabeled_sagemaker_event_stream_is_auto_detected(
-        self, aiohttp_client: AioHttpClient, mock_sse_response: Mock
-    ) -> None:
-        """Inference-component routes may label AWS framing as SSE."""
-        pytest.importorskip("botocore")
-        from aiperf_mock_server.eventstream import encode_payload_part
-
-        frame = encode_payload_part(b'data: {"delta":"from-sagemaker"}\n')
-        with patch("aiohttp.ClientSession") as mock_session_class:
-            mock_sse_response.content = MockStreamReader(
-                [frame[:5], frame[5:11], frame[11:]]
-            )
-            setup_mock_session(mock_session_class, mock_sse_response, ["request"])
-
-            record = await aiohttp_client.post_request(
-                "http://test.com/endpoints/test/inference-components/model/openai/v1",
-                '{"stream": true}',
-                {"Accept": "text/event-stream"},
-            )
-
-        assert record.error is None
-        assert len(record.responses) == 1
-        assert isinstance(record.responses[0], AwsEventStreamMessage)
-        assert record.responses[0].line == '{"delta":"from-sagemaker"}'
 
     @pytest.mark.asyncio
     async def test_concurrent_requests(

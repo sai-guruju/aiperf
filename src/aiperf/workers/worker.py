@@ -49,7 +49,6 @@ from aiperf.common.messages.dataset_messages import (
 )
 from aiperf.common.mixins import ProcessHealthMixin
 from aiperf.common.models import (
-    AwsEventStreamMessage,
     Conversation,
     DatasetClientMetadata,
     DatasetMetadata,
@@ -1597,9 +1596,7 @@ class Worker(BaseComponentService, ProcessHealthMixin):
 
         credit = credit_context.credit
 
-        async def on_first_token(
-            ttft_ns: int, message: SSEMessage | AwsEventStreamMessage
-        ) -> bool:
+        async def on_first_token(ttft_ns: int, message: SSEMessage) -> bool:
             parsed = self.inference_client.endpoint.parse_response(message)
             if parsed is None or parsed.data is None:
                 return False
